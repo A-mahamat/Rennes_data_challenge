@@ -1,22 +1,20 @@
 """
-Agent IA Comparateur de Produits — SerpAPI + Gemini Flash
-==========================================================
-• SerpAPI  (gratuit : 100 recherches/mois) → Google Shopping
-• Gemini Flash (gratuit illimité*)          → Analyse & résumé IA
+Agent IA Comparateur de Produits — Gemini Flash + Google Search
+===============================================================
+Gemini navigue lui-même sur internet via son outil Google Search intégré.
+→ UNE seule clé API gratuite : https://aistudio.google.com
 
-Clés API gratuites :
-  SerpAPI  → https://serpapi.com          (100 req/mois sans CB)
-  Gemini   → https://aistudio.google.com  (gratuit, pas de CB)
+Pas de SerpAPI, pas d'Anthropic. 100% gratuit.
 """
 
 import os
 import re
 import sys
 import json
-import requests
 from typing import Optional
 
 from google import genai
+from google.genai import types
 from pydantic import BaseModel, Field
 
 
@@ -26,11 +24,10 @@ class Product(BaseModel):
     name: str = Field(description="Nom complet du produit")
     price: str = Field(description="Prix affiché (ex: '299,99 €')")
     url: str = Field(description="Lien direct vers la page produit")
-    image_url: Optional[str] = Field(None, description="URL de l'image miniature")
+    image_url: Optional[str] = Field(None, description="URL de l'image")
     description: Optional[str] = Field(None, description="Description courte")
-    rating: Optional[str] = Field(None, description="Note clients formatée")
+    rating: Optional[str] = Field(None, description="Note clients")
     store: Optional[str] = Field(None, description="Nom du site marchand")
-    extracted_price: Optional[float] = Field(None, description="Prix numérique pour tri")
 
 
 class SearchResult(BaseModel):
@@ -39,163 +36,147 @@ class SearchResult(BaseModel):
     summary: str
 
 
+# ── Prompt ────────────────────────────────────────────────────────────────────
+
+SEARCH_PROMPT = """Tu es un agent expert en comparaison de produits.
+
+Utilise Google Search pour trouver {n} produits correspondant à : "{query}"
+
+Instructions :
+- Cherche sur plusieurs sites : Amazon.fr, Fnac, Cdiscount, Darty, Boulanger, Rakuten, etc.
+- Pour chaque produit, récupère le prix actuel, le lien direct, l'image et la note clients
+- Varie les sources pour avoir une vraie comparaison
+
+Retourne UNIQUEMENT un bloc JSON valide (sans texte avant ni après) avec cette structure :
+{{
+  "query": "{query}",
+  "products": [
+    {{
+      "name": "Nom complet du produit",
+      "price": "Prix avec devise ex: 299,99 €",
+      "url": "https://lien-direct-vers-produit.com",
+      "image_url": "https://url-image.jpg ou null",
+      "description": "Description courte en 1 phrase",
+      "rating": "4.5/5 (234 avis) ou null",
+      "store": "amazon.fr"
+    }}
+  ],
+  "summary": "Résumé comparatif en 2-3 phrases : fourchette de prix, meilleur rapport qualité/prix, conseil"
+}}"""
+
+
 # ── Agent principal ───────────────────────────────────────────────────────────
 
 class ProductComparatorAgent:
     """
-    Comparateur de produits utilisant :
-      - SerpAPI Google Shopping pour récupérer les produits (prix, images, liens)
-      - Gemini Flash pour générer un résumé comparatif IA
+    Agent comparateur utilisant Gemini Flash avec Google Search intégré.
+    Gemini navigue lui-même sur internet — aucune autre API requise.
     """
 
-    SERPAPI_URL = "https://serpapi.com/search"
-
-    def __init__(
-        self,
-        serpapi_key: Optional[str] = None,
-        gemini_key: Optional[str] = None,
-        verbose: bool = True,
-    ):
-        self.serpapi_key = serpapi_key or os.getenv("SERPAPI_KEY", "")
-        gemini_key = gemini_key or os.getenv("GEMINI_API_KEY", "")
+    def __init__(self, gemini_key: Optional[str] = None, verbose: bool = True):
         self.verbose = verbose
-
-        if not self.serpapi_key:
-            raise ValueError(
-                "Clé SerpAPI manquante.\n"
-                "→ Obtenez-en une gratuitement sur https://serpapi.com\n"
-                "→ Définissez SERPAPI_KEY ou passez-la au constructeur."
-            )
-        if not gemini_key:
+        key = gemini_key or os.getenv("GEMINI_API_KEY", "")
+        if not key:
             raise ValueError(
                 "Clé Gemini manquante.\n"
-                "→ Obtenez-en une gratuitement sur https://aistudio.google.com\n"
+                "→ Gratuit sur https://aistudio.google.com\n"
                 "→ Définissez GEMINI_API_KEY ou passez-la au constructeur."
             )
-
-        self.gemini = genai.Client(api_key=gemini_key)
+        self.client = genai.Client(api_key=key)
 
     def _log(self, msg: str):
         if self.verbose:
             print(msg, flush=True)
 
-    # ── Recherche ─────────────────────────────────────────────────────────────
-
     def search(self, query: str, max_products: int = 5) -> SearchResult:
         """
-        Recherche des produits et retourne une liste structurée.
+        Recherche des produits sur internet et retourne une liste structurée.
 
         Args:
-            query:        Texte décrivant le produit (ex: "casque bluetooth réduction bruit")
-            max_products: Nombre max de produits à retourner (2–10)
+            query:        Description du produit (ex: "casque bluetooth réduction bruit")
+            max_products: Nombre de produits à retourner
 
         Returns:
-            SearchResult contenant la liste des produits + résumé IA
+            SearchResult avec produits + résumé comparatif
         """
         self._log(f"\n🔍 Recherche : '{query}'")
+        self._log("🌐 Gemini navigue sur internet...\n")
 
-        products = self._fetch_from_serpapi(query, max_products)
-        summary = self._generate_summary(query, products)
-
-        self._log(f"✅ {len(products)} produit(s) trouvé(s)\n")
-        return SearchResult(query=query, products=products, summary=summary)
-
-    # ── SerpAPI ───────────────────────────────────────────────────────────────
-
-    def _fetch_from_serpapi(self, query: str, max_products: int) -> list[Product]:
-        """Appelle l'API Google Shopping de SerpAPI et retourne les produits."""
-        self._log("  🛒 Google Shopping via SerpAPI...")
-
-        params = {
-            "engine": "google_shopping",
-            "q": query,
-            "api_key": self.serpapi_key,
-            "hl": "fr",      # langue : français
-            "gl": "fr",      # pays   : France
-            "num": max(max_products + 5, 10),  # marge pour filtrer les doublons
-        }
+        prompt = SEARCH_PROMPT.format(query=query, n=max_products)
 
         try:
-            resp = requests.get(self.SERPAPI_URL, params=params, timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
-        except requests.RequestException as e:
-            self._log(f"  ❌ Erreur SerpAPI : {e}")
-            return []
-
-        raw_items = data.get("shopping_results", [])
-        if not raw_items:
-            self._log("  ⚠️  Aucun résultat Google Shopping.")
-            return []
-
-        products = []
-        seen_names = set()
-
-        for item in raw_items:
-            name = item.get("title", "").strip()
-            url = item.get("link", "").strip()
-
-            # Ignorer les doublons et les entrées incomplètes
-            if not name or not url or name in seen_names:
-                continue
-            seen_names.add(name)
-
-            # Formater la note
-            rating_str = None
-            if item.get("rating"):
-                rating_str = f"{item['rating']:.1f}/5"
-                reviews = item.get("reviews")
-                if reviews:
-                    rating_str += f"  ({reviews:,} avis)"
-
-            products.append(
-                Product(
-                    name=name,
-                    price=item.get("price", "Prix non disponible"),
-                    url=url,
-                    image_url=item.get("thumbnail"),
-                    description=item.get("snippet"),
-                    rating=rating_str,
-                    store=item.get("source"),
-                    extracted_price=item.get("extracted_price"),
-                )
+            response = self.client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    tools=[types.Tool(google_search=types.GoogleSearch())],
+                    temperature=0.1,
+                ),
             )
-
-            if len(products) >= max_products:
-                break
-
-        return products
-
-    # ── Gemini Flash ──────────────────────────────────────────────────────────
-
-    def _generate_summary(self, query: str, products: list[Product]) -> str:
-        """Génère un résumé comparatif avec Gemini Flash (gratuit)."""
-        if not products:
-            return "Aucun produit trouvé pour cette recherche."
-
-        self._log("  💬 Analyse Gemini Flash...")
-
-        lines = []
-        for p in products:
-            note = p.rating or "N/A"
-            lines.append(f"• {p.name} | {p.price} | {p.store or '?'} | Note : {note}")
-
-        prompt = f"""Tu es un expert en comparaison de produits. Voici les résultats pour "{query}" :
-
-{chr(10).join(lines)}
-
-Rédige un résumé comparatif en 2-3 phrases maximum incluant :
-- la fourchette de prix
-- le meilleur rapport qualité/prix si tu peux l'identifier
-- un conseil d'achat concret"""
-
-        try:
-            response = self.gemini.models.generate_content(
-                model="gemini-2.0-flash", contents=prompt
-            )
-            return response.text.strip()
+            raw_text = response.text or ""
         except Exception as e:
-            return f"Résumé non disponible ({e})"
+            self._log(f"  ❌ Erreur Gemini : {e}")
+            return SearchResult(query=query, products=[], summary=str(e))
+
+        self._log("  📦 Extraction des produits...")
+        result = self._parse_response(raw_text, query)
+        self._log(f"✅ {len(result.products)} produit(s) trouvé(s)\n")
+        return result
+
+    # ── Parsing ───────────────────────────────────────────────────────────────
+
+    def _parse_response(self, text: str, query: str) -> SearchResult:
+        """Extrait le JSON de la réponse de Gemini."""
+
+        # Chercher un bloc ```json ... ```
+        match = re.search(r"```json\s*([\s\S]*?)\s*```", text)
+        json_str = match.group(1) if match else text
+
+        # Chercher le JSON brut si pas de bloc markdown
+        if not match:
+            obj_match = re.search(r"\{[\s\S]*\"products\"[\s\S]*\}", text)
+            if obj_match:
+                json_str = obj_match.group()
+
+        try:
+            data = json.loads(json_str)
+            products = [
+                Product(
+                    name=p.get("name", "Produit inconnu"),
+                    price=p.get("price", "Prix non disponible"),
+                    url=p.get("url", ""),
+                    image_url=p.get("image_url") or None,
+                    description=p.get("description") or None,
+                    rating=p.get("rating") or None,
+                    store=p.get("store") or None,
+                )
+                for p in data.get("products", [])
+                if p.get("name") and p.get("url")
+            ]
+            return SearchResult(
+                query=data.get("query", query),
+                products=products,
+                summary=data.get("summary", ""),
+            )
+        except (json.JSONDecodeError, Exception):
+            # Fallback : demander à Gemini de structurer sans search
+            return self._fallback_structure(text, query)
+
+    def _fallback_structure(self, raw: str, query: str) -> SearchResult:
+        """Si le JSON est malformé, Gemini re-structure sans recherche web."""
+        self._log("  🔄 Re-structuration des données...")
+        try:
+            resp = self.client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=(
+                    f"Extrait les produits de ce texte en JSON strict "
+                    f"(query, products[], summary) pour '{query}':\n\n{raw[:4000]}"
+                ),
+                config=types.GenerateContentConfig(temperature=0),
+            )
+            return self._parse_response(resp.text or "", query)
+        except Exception:
+            return SearchResult(query=query, products=[], summary="Aucun résultat structuré.")
 
 
 # ── Affichage CLI ─────────────────────────────────────────────────────────────
@@ -225,7 +206,6 @@ def display_results(result: SearchResult):
     if result.summary:
         print("\n" + "─" * 65)
         print(f"  💡 RÉSUMÉ IA : {result.summary}")
-
     print("\n" + "═" * 65)
 
 
@@ -240,8 +220,7 @@ def export_html(result: SearchResult, path: str):
     for p in result.products:
         img = (
             f'<img src="{p.image_url}" alt="" onerror="this.style.display=\'none\'">'
-            if p.image_url
-            else '<div class="no-img">📦</div>'
+            if p.image_url else '<div class="no-img">📦</div>'
         )
         rating_html = f'<div class="rating">⭐ {p.rating}</div>' if p.rating else ""
         desc_html = f'<p class="desc">{p.description}</p>' if p.description else ""
@@ -253,9 +232,7 @@ def export_html(result: SearchResult, path: str):
           <div class="body">
             <h3><a href="{p.url}" target="_blank">{p.name}</a></h3>
             {desc_html}
-            <div class="meta">
-              <span class="price">{p.price}</span>{store_html}
-            </div>
+            <div class="meta"><span class="price">{p.price}</span>{store_html}</div>
             {rating_html}
             <a class="btn" href="{p.url}" target="_blank">Voir le produit →</a>
           </div>
@@ -266,33 +243,25 @@ def export_html(result: SearchResult, path: str):
 <title>Comparateur – {result.query}</title>
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
-body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
-     background:#f0f2f5;color:#333;padding:24px}}
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f0f2f5;color:#333;padding:24px}}
 h1{{text-align:center;font-size:1.8rem;margin-bottom:6px}}
 .sub{{text-align:center;color:#666;margin-bottom:20px}}
-.summary{{background:#fff3cd;border-left:4px solid #ffc107;padding:12px 16px;
-          border-radius:6px;margin-bottom:24px;font-style:italic}}
+.summary{{background:#fff3cd;border-left:4px solid #ffc107;padding:12px 16px;border-radius:6px;margin-bottom:24px;font-style:italic}}
 .grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:18px}}
-.card{{background:#fff;border-radius:12px;overflow:hidden;
-       box-shadow:0 2px 10px rgba(0,0,0,.1);display:flex;flex-direction:column;
-       transition:transform .2s}}
-.card:hover{{transform:translateY(-4px);box-shadow:0 6px 20px rgba(0,0,0,.15)}}
-.img-wrap{{height:190px;display:flex;align-items:center;justify-content:center;
-           background:#f8f9fa;padding:10px;overflow:hidden}}
+.card{{background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 2px 10px rgba(0,0,0,.1);display:flex;flex-direction:column;transition:transform .2s}}
+.card:hover{{transform:translateY(-4px)}}
+.img-wrap{{height:190px;display:flex;align-items:center;justify-content:center;background:#f8f9fa;padding:10px}}
 .img-wrap img{{max-height:100%;max-width:100%;object-fit:contain}}
 .no-img{{font-size:3.5rem}}
 .body{{padding:14px;display:flex;flex-direction:column;gap:6px;flex:1}}
 .body h3{{font-size:.95rem;line-height:1.4}}
 .body h3 a{{text-decoration:none;color:#1a1a2e}}
-.body h3 a:hover{{color:#0066cc}}
 .desc{{font-size:.82rem;color:#666;line-height:1.5}}
 .meta{{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:4px}}
 .price{{font-size:1.35rem;font-weight:700;color:#e63946}}
 .store{{font-size:.75rem;background:#e8f4fd;color:#0066cc;padding:2px 8px;border-radius:20px}}
 .rating{{font-size:.83rem;color:#f4a261}}
-.btn{{margin-top:auto;display:block;text-align:center;background:#0066cc;color:#fff;
-      padding:10px;border-radius:8px;text-decoration:none;font-size:.88rem;
-      transition:background .2s}}
+.btn{{margin-top:auto;display:block;text-align:center;background:#0066cc;color:#fff;padding:10px;border-radius:8px;text-decoration:none;font-size:.88rem}}
 .btn:hover{{background:#0052a3}}
 footer{{text-align:center;margin-top:28px;color:#999;font-size:.78rem}}
 </style></head><body>
@@ -300,7 +269,7 @@ footer{{text-align:center;margin-top:28px;color:#999;font-size:.78rem}}
 <p class="sub">Résultats pour : <strong>{result.query}</strong> — {len(result.products)} produit(s)</p>
 {"<div class='summary'>💡 " + result.summary + "</div>" if result.summary else ""}
 <div class="grid">{cards}</div>
-<footer>Propulsé par SerpAPI + Gemini Flash · Agent Comparateur IA</footer>
+<footer>Propulsé par Gemini Flash + Google Search · Agent Comparateur IA</footer>
 </body></html>"""
 
     with open(path, "w", encoding="utf-8") as f:
@@ -312,16 +281,15 @@ footer{{text-align:center;margin-top:28px;color:#999;font-size:.78rem}}
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage : python product_comparator.py \"<produit>\" [nombre]")
+        print('Usage : python product_comparator.py "<produit>" [nombre]')
         print('Exemple: python product_comparator.py "casque bluetooth" 5')
         sys.exit(1)
 
     query = sys.argv[1]
     max_products = int(sys.argv[2]) if len(sys.argv) > 2 else 5
 
-    agent = ProductComparatorAgent()          # lit SERPAPI_KEY + GEMINI_API_KEY
+    agent = ProductComparatorAgent()
     result = agent.search(query, max_products)
-
     display_results(result)
 
     safe = re.sub(r"[^\w\s-]", "", query).strip().replace(" ", "_")[:30]

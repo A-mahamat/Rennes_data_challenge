@@ -16,7 +16,7 @@ import json
 import requests
 from typing import Optional
 
-import google.generativeai as genai
+from google import genai
 from pydantic import BaseModel, Field
 
 
@@ -73,8 +73,7 @@ class ProductComparatorAgent:
                 "→ Définissez GEMINI_API_KEY ou passez-la au constructeur."
             )
 
-        genai.configure(api_key=gemini_key)
-        self.gemini = genai.GenerativeModel("gemini-1.5-flash")
+        self.gemini = genai.Client(api_key=gemini_key)
 
     def _log(self, msg: str):
         if self.verbose:
@@ -191,7 +190,9 @@ Rédige un résumé comparatif en 2-3 phrases maximum incluant :
 - un conseil d'achat concret"""
 
         try:
-            response = self.gemini.generate_content(prompt)
+            response = self.gemini.models.generate_content(
+                model="gemini-2.0-flash", contents=prompt
+            )
             return response.text.strip()
         except Exception as e:
             return f"Résumé non disponible ({e})"

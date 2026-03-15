@@ -166,10 +166,7 @@ def search_products(
 DEFAULT_SERPAPI = os.getenv("SERPAPI_KEY", "")
 DEFAULT_GEMINI = os.getenv("GEMINI_API_KEY", "")
 
-with gr.Blocks(
-    title="🛒 Comparateur de Produits IA",
-    theme=gr.themes.Soft(),
-) as demo:
+with gr.Blocks(title="🛒 Comparateur de Produits IA") as demo:
 
     gr.Markdown(
         """
@@ -263,4 +260,4 @@ with gr.Blocks(
     )
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860, show_error=True)
+    demo.launch(server_name="0.0.0.0", server_port=7860, show_error=True, theme=gr.themes.Soft())
